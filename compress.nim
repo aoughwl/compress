@@ -6,6 +6,36 @@
 ## agnostic: `http` layers HTTP `Content-Encoding` negotiation on top, and any
 ## binary protocol (WebSocket permessage-deflate, on-disk blobs, …) can reuse
 ## them directly.
+##
+## Two API flavours per operation:
+##
+## * The string-returning procs (`gzipCompress`, `gzipDecompress`, …) return the
+##   payload directly and signal failure with the empty string `""`. Convenient,
+##   but a genuinely-empty result is indistinguishable from an error.
+## * The `try*` procs (`tryGzipCompress`, `tryGzipDecompress`, …) return a small
+##   `CompressResult` object carrying an explicit `ok` flag alongside `data`, so
+##   a failure (`ok = false`) is unambiguous. Empty **input** always succeeds
+##   with empty `data` (`ok = true`, `data = ""`). The string procs are thin
+##   wrappers over these.
+##
+## Every decompressor is bounded by a `maxSize` cap (default 16 MiB) and aborts
+## rather than materialise an oversized output — this closes the decompression-
+## bomb hole where a tiny payload inflates to gigabytes.
+##
+## Streaming note: this package is deliberately one-shot — the whole input and
+## output live in memory. A chunked/streaming codec (feeding fixed-size blocks
+## through a retained `z_stream`/`ZSTD_DCtx`) is out of scope here; layer it in a
+## separate API if you need to bound memory below `maxSize` for huge payloads.
+
+type
+  CompressResult* = object
+    ## Outcome of a `try*` codec call. `ok` is the success signal; `data` is the
+    ## payload. On failure `ok = false` and `data = ""`. On empty input
+    ## `ok = true` and `data = ""` (a legitimately-empty success).
+    ok*: bool
+    data*: string
+
+const DefaultMaxSize = 16 * 1024 * 1024   ## 16 MiB decompression cap.
 
 const
   zlib = "libz.so.1"
@@ -53,18 +83,19 @@ const
   Z_DEFLATED = cint(8)
   GZIP_WINDOW = cint(31)   # 15 (max window) + 16 (gzip wrapper)
 
-proc gzipCompress*(data: string; level = 6): string =
-  ## Compress `data` into the gzip format (`Content-Encoding: gzip`). "" on error.
-  result = ""
+proc tryGzipCompress*(data: string; level = 6): CompressResult =
+  ## Compress `data` into the gzip format (`Content-Encoding: gzip`).
+  ## Empty input → `ok = true`, empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   var strm = default(ZStream)
   if deflateInit2Raw(addr strm, cint(level), Z_DEFLATED, GZIP_WINDOW, cint(8), cint(0),
                    zlibVersion(), cint(sizeof(ZStream))) != Z_OK:
-    return ""
+    return result
   var inCopy = data
-  if data.len > 0:
-    strm.nextIn = cast[pointer](toCString(inCopy))
-  else:
-    strm.nextIn = cast[pointer](0)
+  strm.nextIn = cast[pointer](toCString(inCopy))
   strm.availIn = uint32(data.len)
   var outBuf = default(array[16384, char])
   while true:
@@ -74,23 +105,32 @@ proc gzipCompress*(data: string; level = 6): string =
     let produced = outBuf.len - int(strm.availOut)
     var i = 0
     while i < produced:
-      result.add outBuf[i]
+      result.data.add outBuf[i]
       inc i
     if rc == Z_STREAM_END:
       break
     if rc < Z_OK:
       discard deflateEnd(addr strm)
-      return ""
+      return CompressResult(ok: false, data: "")
   discard deflateEnd(addr strm)
+  result.ok = true
 
-proc gzipDecompress*(data: string): string =
-  ## Decompress a gzip (or zlib) payload. "" on error.
-  result = ""
-  if data.len == 0: return ""
+proc gzipCompress*(data: string; level = 6): string =
+  ## Compress `data` into the gzip format (`Content-Encoding: gzip`). "" on error.
+  tryGzipCompress(data, level).data
+
+proc tryGzipDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
+  ## Decompress a gzip (or zlib) payload, bounded by `maxSize`: if the inflated
+  ## output would exceed `maxSize` the call aborts with `ok = false` (this closes
+  ## the decompression-bomb hole). Empty input → `ok = true`, empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   var strm = default(ZStream)
   # windowBits 15+32 → auto-detect gzip or zlib header.
   if inflateInit2Raw(addr strm, cint(47), zlibVersion(), cint(sizeof(ZStream))) != Z_OK:
-    return ""
+    return result
   var inCopy = data
   strm.nextIn = cast[pointer](toCString(inCopy))
   strm.availIn = uint32(data.len)
@@ -100,18 +140,28 @@ proc gzipDecompress*(data: string): string =
     strm.availOut = uint32(outBuf.len)
     let rc = inflate(addr strm, Z_NO_FLUSH)
     let produced = outBuf.len - int(strm.availOut)
+    if result.data.len + produced > maxSize:
+      # Decompression bomb: output would exceed the cap. Abort as failure.
+      discard inflateEnd(addr strm)
+      return CompressResult(ok: false, data: "")
     var i = 0
     while i < produced:
-      result.add outBuf[i]
+      result.data.add outBuf[i]
       inc i
     if rc == Z_STREAM_END:
       break
     if rc < Z_OK:
       discard inflateEnd(addr strm)
-      return ""
+      return CompressResult(ok: false, data: "")
     if strm.availIn == 0'u32 and produced == 0:
       break
   discard inflateEnd(addr strm)
+  result.ok = true
+
+proc gzipDecompress*(data: string; maxSize = DefaultMaxSize): string =
+  ## Decompress a gzip (or zlib) payload, bounded by `maxSize`. "" on error
+  ## (including a payload that inflates past `maxSize`).
+  tryGzipDecompress(data, maxSize).data
 
 # ---------------------------------------------------------------------------
 # Brotli
@@ -135,33 +185,50 @@ proc collectOut(p: pointer; n: int): string =
     result.add a[i]
     inc i
 
-proc brotliCompress*(data: string; quality = 5): string =
-  ## Compress `data` with Brotli (`Content-Encoding: br`). "" on error.
-  result = ""
+proc tryBrotliCompress*(data: string; quality = 5): CompressResult =
+  ## Compress `data` with Brotli (`Content-Encoding: br`).
+  ## Empty input → `ok = true`, empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   let cap = int(BrotliEncoderMaxCompressedSize(csize_t(data.len)))
-  if cap <= 0: return ""
+  if cap <= 0: return result
   var outBuf = newString(cap)
   var outLen = csize_t(cap)
   var inCopy = data
-  var inPtr = cast[pointer](0)
-  if data.len > 0: inPtr = cast[pointer](toCString(inCopy))
+  let inPtr = cast[pointer](toCString(inCopy))
   let rc = BrotliEncoderCompress(cint(quality), cint(22), BROTLI_MODE_GENERIC,
                                  csize_t(data.len), inPtr, addr outLen,
                                  cast[pointer](toCString(outBuf)))
-  if rc == cint(0): return ""
-  collectOut(cast[pointer](toCString(outBuf)), int(outLen))
+  if rc == cint(0): return result
+  result.data = collectOut(cast[pointer](toCString(outBuf)), int(outLen))
+  result.ok = true
 
-proc brotliDecompress*(data: string; maxSize = 16 * 1024 * 1024): string =
-  ## Decompress a Brotli payload, bounded by `maxSize`. "" on error.
-  result = ""
-  if data.len == 0: return ""
+proc brotliCompress*(data: string; quality = 5): string =
+  ## Compress `data` with Brotli (`Content-Encoding: br`). "" on error.
+  tryBrotliCompress(data, quality).data
+
+proc tryBrotliDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
+  ## Decompress a Brotli payload, bounded by `maxSize` (the output buffer is
+  ## sized to the cap, so inflation past it fails). Empty input → `ok = true`,
+  ## empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   var outBuf = newString(maxSize)
   var outLen = csize_t(maxSize)
   var inCopy = data
   let rc = BrotliDecoderDecompress(csize_t(data.len), cast[pointer](toCString(inCopy)),
                                    addr outLen, cast[pointer](toCString(outBuf)))
-  if rc != BROTLI_DECODER_RESULT_SUCCESS: return ""
-  collectOut(cast[pointer](toCString(outBuf)), int(outLen))
+  if rc != BROTLI_DECODER_RESULT_SUCCESS: return result
+  result.data = collectOut(cast[pointer](toCString(outBuf)), int(outLen))
+  result.ok = true
+
+proc brotliDecompress*(data: string; maxSize = DefaultMaxSize): string =
+  ## Decompress a Brotli payload, bounded by `maxSize`. "" on error.
+  tryBrotliDecompress(data, maxSize).data
 
 # ---------------------------------------------------------------------------
 # Zstandard
@@ -174,27 +241,44 @@ proc ZSTD_decompress(dst: pointer; dstCap: csize_t; src: pointer;
 proc ZSTD_compressBound(srcSize: csize_t): csize_t {.cdecl, importc: "ZSTD_compressBound", dynlib: zstdLib.}
 proc ZSTD_isError(code: csize_t): cuint {.cdecl, importc: "ZSTD_isError", dynlib: zstdLib.}
 
-proc zstdCompress*(data: string; level = 3): string =
-  ## Compress `data` with Zstandard (`Content-Encoding: zstd`). "" on error.
-  result = ""
+proc tryZstdCompress*(data: string; level = 3): CompressResult =
+  ## Compress `data` with Zstandard (`Content-Encoding: zstd`).
+  ## Empty input → `ok = true`, empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   let cap = int(ZSTD_compressBound(csize_t(data.len)))
-  if cap <= 0: return ""
+  if cap <= 0: return result
   var outBuf = newString(cap)
   var inCopy = data
-  var inPtr = cast[pointer](0)
-  if data.len > 0: inPtr = cast[pointer](toCString(inCopy))
+  let inPtr = cast[pointer](toCString(inCopy))
   let n = ZSTD_compress(cast[pointer](toCString(outBuf)), csize_t(cap), inPtr,
                         csize_t(data.len), cint(level))
-  if ZSTD_isError(n) != cuint(0): return ""
-  collectOut(cast[pointer](toCString(outBuf)), int(n))
+  if ZSTD_isError(n) != cuint(0): return result
+  result.data = collectOut(cast[pointer](toCString(outBuf)), int(n))
+  result.ok = true
 
-proc zstdDecompress*(data: string; maxSize = 16 * 1024 * 1024): string =
-  ## Decompress a Zstandard payload, bounded by `maxSize`. "" on error.
-  result = ""
-  if data.len == 0: return ""
+proc zstdCompress*(data: string; level = 3): string =
+  ## Compress `data` with Zstandard (`Content-Encoding: zstd`). "" on error.
+  tryZstdCompress(data, level).data
+
+proc tryZstdDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
+  ## Decompress a Zstandard payload, bounded by `maxSize` (the output buffer is
+  ## sized to the cap, so inflation past it fails). Empty input → `ok = true`,
+  ## empty `data`.
+  result = CompressResult(ok: false, data: "")
+  if data.len == 0:
+    result.ok = true
+    return result
   var outBuf = newString(maxSize)
   var inCopy = data
   let n = ZSTD_decompress(cast[pointer](toCString(outBuf)), csize_t(maxSize),
                           cast[pointer](toCString(inCopy)), csize_t(data.len))
-  if ZSTD_isError(n) != cuint(0): return ""
-  collectOut(cast[pointer](toCString(outBuf)), int(n))
+  if ZSTD_isError(n) != cuint(0): return result
+  result.data = collectOut(cast[pointer](toCString(outBuf)), int(n))
+  result.ok = true
+
+proc zstdDecompress*(data: string; maxSize = DefaultMaxSize): string =
+  ## Decompress a Zstandard payload, bounded by `maxSize`. "" on error.
+  tryZstdDecompress(data, maxSize).data
