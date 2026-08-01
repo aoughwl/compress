@@ -27,6 +27,9 @@
 ## through a retained `z_stream`/`ZSTD_DCtx`) is out of scope here; layer it in a
 ## separate API if you need to bound memory below `maxSize` for huge payloads.
 
+import codecopts
+export codecopts
+
 type
   CompressResult* = object
     ## Outcome of a `try*` codec call. `ok` is the success signal; `data` is the
@@ -34,8 +37,6 @@ type
     ## `ok = true` and `data = ""` (a legitimately-empty success).
     ok*: bool
     data*: string
-
-const DefaultMaxSize = 16 * 1024 * 1024   ## 16 MiB decompression cap.
 
 const
   zlib = "libz.so.1"
@@ -81,18 +82,21 @@ const
   Z_OK = cint(0)
   Z_STREAM_END = cint(1)
   Z_DEFLATED = cint(8)
-  GZIP_WINDOW = cint(31)   # 15 (max window) + 16 (gzip wrapper)
 
-proc tryGzipCompress*(data: string; level = 6): CompressResult =
-  ## Compress `data` into the gzip format (`Content-Encoding: gzip`).
-  ## Empty input → `ok = true`, empty `data`.
+proc tryDeflateCompress*(data: string; opts: CodecOpts): CompressResult =
+  ## The zlib-family compressor, with the format chosen by `opts.windowBits`:
+  ## `WindowGzip` (gzip), `WindowZlib` (`Content-Encoding: deflate`), or
+  ## `WindowRaw` (no wrapper — permessage-deflate). These were all one code
+  ## path already; only the wrapper differs, and it was welded shut at 31.
   result = CompressResult(ok: false, data: "")
   if data.len == 0:
     result.ok = true
     return result
   var strm = default(ZStream)
-  if deflateInit2Raw(addr strm, cint(level), Z_DEFLATED, GZIP_WINDOW, cint(8), cint(0),
-                   zlibVersion(), cint(sizeof(ZStream))) != Z_OK:
+  if deflateInit2Raw(addr strm, cint(opts.level), Z_DEFLATED,
+                     cint(opts.windowBits), cint(opts.memLevel),
+                     cint(opts.strategy),
+                     zlibVersion(), cint(sizeof(ZStream))) != Z_OK:
     return result
   var inCopy = data
   strm.nextIn = cast[pointer](toCString(inCopy))
@@ -115,21 +119,30 @@ proc tryGzipCompress*(data: string; level = 6): CompressResult =
   discard deflateEnd(addr strm)
   result.ok = true
 
-proc gzipCompress*(data: string; level = 6): string =
+proc tryGzipCompress*(data: string; level = DefaultLevel): CompressResult =
+  ## Compress `data` into the gzip format (`Content-Encoding: gzip`).
+  ## Empty input → `ok = true`, empty `data`.
+  var opts = defaultCodecOpts()
+  opts.level = level
+  tryDeflateCompress(data, opts)
+
+proc gzipCompress*(data: string; level = DefaultLevel): string =
   ## Compress `data` into the gzip format (`Content-Encoding: gzip`). "" on error.
   tryGzipCompress(data, level).data
 
-proc tryGzipDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
-  ## Decompress a gzip (or zlib) payload, bounded by `maxSize`: if the inflated
-  ## output would exceed `maxSize` the call aborts with `ok = false` (this closes
-  ## the decompression-bomb hole). Empty input → `ok = true`, empty `data`.
+proc tryDeflateDecompress*(data: string; opts: CodecOpts): CompressResult =
+  ## The zlib-family decompressor. The window comes from `inflateWindow(opts)`
+  ## rather than from a field: a mismatch between the wrapper written and the
+  ## wrapper expected fails silently (inflate simply returns an error), so it
+  ## is derived from the compressor's format instead of asked for twice.
   result = CompressResult(ok: false, data: "")
   if data.len == 0:
     result.ok = true
     return result
+  let maxSize = capOr(opts)
   var strm = default(ZStream)
-  # windowBits 15+32 → auto-detect gzip or zlib header.
-  if inflateInit2Raw(addr strm, cint(47), zlibVersion(), cint(sizeof(ZStream))) != Z_OK:
+  if inflateInit2Raw(addr strm, cint(inflateWindow(opts)), zlibVersion(),
+                     cint(sizeof(ZStream))) != Z_OK:
     return result
   var inCopy = data
   strm.nextIn = cast[pointer](toCString(inCopy))
@@ -140,8 +153,10 @@ proc tryGzipDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult 
     strm.availOut = uint32(outBuf.len)
     let rc = inflate(addr strm, Z_NO_FLUSH)
     let produced = outBuf.len - int(strm.availOut)
-    if result.data.len + produced > maxSize:
+    if maxSize > 0 and result.data.len + produced > maxSize:
       # Decompression bomb: output would exceed the cap. Abort as failure.
+      # `maxSize == 0` is an explicit "no cap", which only a caller that has
+      # already bounded the input some other way should be choosing.
       discard inflateEnd(addr strm)
       return CompressResult(ok: false, data: "")
     var i = 0
@@ -158,10 +173,26 @@ proc tryGzipDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult 
   discard inflateEnd(addr strm)
   result.ok = true
 
+proc tryGzipDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
+  ## Decompress a gzip (or zlib) payload, bounded by `maxSize`: if the inflated
+  ## output would exceed `maxSize` the call aborts with `ok = false` (this closes
+  ## the decompression-bomb hole). Empty input → `ok = true`, empty `data`.
+  var opts = defaultCodecOpts()
+  opts.maxSize = maxSize
+  tryDeflateDecompress(data, opts)
+
 proc gzipDecompress*(data: string; maxSize = DefaultMaxSize): string =
   ## Decompress a gzip (or zlib) payload, bounded by `maxSize`. "" on error
   ## (including a payload that inflates past `maxSize`).
   tryGzipDecompress(data, maxSize).data
+
+proc deflateCompress*(data: string; opts: CodecOpts): string =
+  ## Zlib-family compression under an explicit format. "" on error.
+  tryDeflateCompress(data, opts).data
+
+proc deflateDecompress*(data: string; opts: CodecOpts): string =
+  ## Zlib-family decompression under an explicit format. "" on error.
+  tryDeflateDecompress(data, opts).data
 
 # ---------------------------------------------------------------------------
 # Brotli
@@ -185,9 +216,10 @@ proc collectOut(p: pointer; n: int): string =
     result.add a[i]
     inc i
 
-proc tryBrotliCompress*(data: string; quality = 5): CompressResult =
-  ## Compress `data` with Brotli (`Content-Encoding: br`).
-  ## Empty input → `ok = true`, empty `data`.
+proc tryBrotliCompress*(data: string; opts: CodecOpts): CompressResult =
+  ## Compress `data` with Brotli under an explicit policy. `lgwin` and the
+  ## encoder mode were both literals here; a text-mode encode of markup is a
+  ## measurable win and was simply not expressible.
   result = CompressResult(ok: false, data: "")
   if data.len == 0:
     result.ok = true
@@ -198,16 +230,28 @@ proc tryBrotliCompress*(data: string; quality = 5): CompressResult =
   var outLen = csize_t(cap)
   var inCopy = data
   let inPtr = cast[pointer](toCString(inCopy))
-  let rc = BrotliEncoderCompress(cint(quality), cint(22), BROTLI_MODE_GENERIC,
+  let rc = BrotliEncoderCompress(cint(opts.brotliQuality), cint(opts.brotliWindow),
+                                 cint(opts.brotliMode),
                                  csize_t(data.len), inPtr, addr outLen,
                                  cast[pointer](toCString(outBuf)))
   if rc == cint(0): return result
   result.data = collectOut(cast[pointer](toCString(outBuf)), int(outLen))
   result.ok = true
 
-proc brotliCompress*(data: string; quality = 5): string =
+proc tryBrotliCompress*(data: string; quality = DefaultBrotliQuality): CompressResult =
+  ## Compress `data` with Brotli (`Content-Encoding: br`).
+  ## Empty input → `ok = true`, empty `data`.
+  var opts = defaultCodecOpts()
+  opts.brotliQuality = quality
+  tryBrotliCompress(data, opts)
+
+proc brotliCompress*(data: string; quality = DefaultBrotliQuality): string =
   ## Compress `data` with Brotli (`Content-Encoding: br`). "" on error.
   tryBrotliCompress(data, quality).data
+
+proc brotliCompress*(data: string; opts: CodecOpts): string =
+  ## Compress `data` with Brotli under an explicit policy. "" on error.
+  tryBrotliCompress(data, opts).data
 
 proc tryBrotliDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult =
   ## Decompress a Brotli payload, bounded by `maxSize` (the output buffer is
@@ -263,7 +307,15 @@ const
   ZstdContentSizeUnknown = high(culonglong)
   ZstdContentSizeError = high(culonglong) - culonglong(1)
 
-proc tryZstdCompress*(data: string; level = 3): CompressResult =
+proc tryBrotliDecompress*(data: string; opts: CodecOpts): CompressResult =
+  ## Decompress a Brotli payload under an explicit policy.
+  tryBrotliDecompress(data, capOr(opts))
+
+proc brotliDecompress*(data: string; opts: CodecOpts): string =
+  ## Decompress a Brotli payload under an explicit policy. "" on error.
+  tryBrotliDecompress(data, capOr(opts)).data
+
+proc tryZstdCompress*(data: string; level = DefaultZstdLevel): CompressResult =
   ## Compress `data` with Zstandard (`Content-Encoding: zstd`).
   ## Empty input → `ok = true`, empty `data`.
   result = CompressResult(ok: false, data: "")
@@ -319,3 +371,19 @@ proc tryZstdDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult 
 proc zstdDecompress*(data: string; maxSize = DefaultMaxSize): string =
   ## Decompress a Zstandard payload, bounded by `maxSize`. "" on error.
   tryZstdDecompress(data, maxSize).data
+
+proc tryZstdCompress*(data: string; opts: CodecOpts): CompressResult =
+  ## Compress `data` with Zstandard at `opts.zstdLevel`.
+  tryZstdCompress(data, opts.zstdLevel)
+
+proc zstdCompress*(data: string; opts: CodecOpts): string =
+  ## Compress `data` with Zstandard under an explicit policy. "" on error.
+  tryZstdCompress(data, opts.zstdLevel).data
+
+proc tryZstdDecompress*(data: string; opts: CodecOpts): CompressResult =
+  ## Decompress a Zstandard payload under an explicit policy.
+  tryZstdDecompress(data, capOr(opts))
+
+proc zstdDecompress*(data: string; opts: CodecOpts): string =
+  ## Decompress a Zstandard payload under an explicit policy. "" on error.
+  tryZstdDecompress(data, capOr(opts)).data
