@@ -217,14 +217,29 @@ proc tryBrotliDecompress*(data: string; maxSize = DefaultMaxSize): CompressResul
   if data.len == 0:
     result.ok = true
     return result
-  var outBuf = newString(maxSize)
-  var outLen = csize_t(maxSize)
   var inCopy = data
-  let rc = BrotliDecoderDecompress(csize_t(data.len), cast[pointer](toCString(inCopy)),
-                                   addr outLen, cast[pointer](toCString(outBuf)))
-  if rc != BROTLI_DECODER_RESULT_SUCCESS: return result
-  result.data = collectOut(cast[pointer](toCString(outBuf)), int(outLen))
-  result.ok = true
+  let inPtr = cast[pointer](toCString(inCopy))
+  # Brotli carries no decompressed size, so start from a guess and double until
+  # it fits or the cap is reached. `maxSize` is a LIMIT: sizing the first buffer
+  # to it meant every small payload cost 16 MiB. A too-small output buffer and a
+  # corrupt payload both report ERROR, so a genuinely broken input costs a few
+  # doublings before failing — bounded, and cheap next to the old allocation.
+  var room = data.len * 4
+  if room < 1024: room = 1024
+  if room > maxSize: room = maxSize
+  while true:
+    var outBuf = newString(room)
+    var outLen = csize_t(room)
+    let rc = BrotliDecoderDecompress(csize_t(data.len), inPtr,
+                                     addr outLen, cast[pointer](toCString(outBuf)))
+    if rc == BROTLI_DECODER_RESULT_SUCCESS:
+      result.data = collectOut(cast[pointer](toCString(outBuf)), int(outLen))
+      result.ok = true
+      return result
+    if room >= maxSize:
+      return result                     # genuinely broken, or past the cap
+    room = room * 2
+    if room > maxSize: room = maxSize
 
 proc brotliDecompress*(data: string; maxSize = DefaultMaxSize): string =
   ## Decompress a Brotli payload, bounded by `maxSize`. "" on error.
@@ -240,6 +255,13 @@ proc ZSTD_decompress(dst: pointer; dstCap: csize_t; src: pointer;
                      srcSize: csize_t): csize_t {.cdecl, importc: "ZSTD_decompress", dynlib: zstdLib.}
 proc ZSTD_compressBound(srcSize: csize_t): csize_t {.cdecl, importc: "ZSTD_compressBound", dynlib: zstdLib.}
 proc ZSTD_isError(code: csize_t): cuint {.cdecl, importc: "ZSTD_isError", dynlib: zstdLib.}
+proc ZSTD_getFrameContentSize(src: pointer; srcSize: csize_t): culonglong
+  {.cdecl, importc: "ZSTD_getFrameContentSize", dynlib: zstdLib.}
+
+const
+  # ZSTD_CONTENTSIZE_UNKNOWN = 0ULL - 1, ZSTD_CONTENTSIZE_ERROR = 0ULL - 2
+  ZstdContentSizeUnknown = high(culonglong)
+  ZstdContentSizeError = high(culonglong) - culonglong(1)
 
 proc tryZstdCompress*(data: string; level = 3): CompressResult =
   ## Compress `data` with Zstandard (`Content-Encoding: zstd`).
@@ -271,10 +293,25 @@ proc tryZstdDecompress*(data: string; maxSize = DefaultMaxSize): CompressResult 
   if data.len == 0:
     result.ok = true
     return result
-  var outBuf = newString(maxSize)
   var inCopy = data
-  let n = ZSTD_decompress(cast[pointer](toCString(outBuf)), csize_t(maxSize),
-                          cast[pointer](toCString(inCopy)), csize_t(data.len))
+  let inPtr = cast[pointer](toCString(inCopy))
+  # A zstd frame header usually records the decompressed size. Use it instead of
+  # allocating the whole cap: `maxSize` is a LIMIT, and sizing every buffer to it
+  # meant a 100-byte payload still cost 16 MiB.
+  var room = maxSize
+  let declared = ZSTD_getFrameContentSize(inPtr, csize_t(data.len))
+  if declared == ZstdContentSizeError:
+    return result
+  if declared != ZstdContentSizeUnknown:
+    if declared > culonglong(maxSize):
+      return result                     # would inflate past the cap
+    room = int(declared)
+    if room == 0:
+      result.ok = true
+      return result
+  var outBuf = newString(room)
+  let n = ZSTD_decompress(cast[pointer](toCString(outBuf)), csize_t(room),
+                          inPtr, csize_t(data.len))
   if ZSTD_isError(n) != cuint(0): return result
   result.data = collectOut(cast[pointer](toCString(outBuf)), int(n))
   result.ok = true
